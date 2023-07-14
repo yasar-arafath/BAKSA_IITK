@@ -16,8 +16,6 @@ test_name = "test.txt"
 model_save_names = ["../checkpoint/cnn_model.txt", "../checkpoint/attention_model.txt"]
 
 
-
-
 import random
 import numpy as np
 
@@ -76,7 +74,22 @@ train_data, test_data = data.TabularDataset.splits(
                                         format = 'tsv',
                                         fields = fields,
                                         skip_header = True)
-train_data, valid_data = train_data.split(random_state = random.seed(SEED))
+
+# Reduce the size of the training dataset
+fraction = 0.5  # Fraction of the data to keep
+num_samples = 1000  # Number of samples to keep
+
+if fraction is not None:
+    # Randomly sample a fraction of the data
+    random.shuffle(train_data.examples)
+    num_samples = int(len(train_data) * fraction)
+    train_data.examples = train_data.examples[:num_samples]
+elif num_samples is not None:
+    # Keep a specific number of samples
+    train_data.examples = train_data.examples[:num_samples]
+
+train_data, valid_data = train_data.split(random_state=random.seed(SEED))
+
 print('Data loading complete')
 print(f"Number of training examples: {len(train_data)}")
 print(f"Number of validation examples: {len(valid_data)}")
@@ -169,26 +182,31 @@ log_softmax = log_softmax.to(device)
 from sklearn.metrics import f1_score
 
 def categorical_accuracy(preds, y):
-    count0,count1,count2 = torch.zeros(1),torch.zeros(1),torch.zeros(1)
-    total0,total1,total2 = torch.FloatTensor(1),torch.FloatTensor(1),torch.FloatTensor(1)
-    max_preds = preds.argmax(dim = 1, keepdim = True) # get the index of the max probability
+    count0, count1, count2 = torch.zeros(1), torch.zeros(1), torch.zeros(1)
+    total0, total1, total2 = torch.FloatTensor(1), torch.FloatTensor(1), torch.FloatTensor(1)
+    max_preds = preds.argmax(dim=1, keepdim=True)  # get the index of the max probability
     correct = max_preds.squeeze(1).eq(y)
     predictions = max_preds.squeeze(1)
-    true_correct = [0,0,0]
-    for j,i in enumerate(y.cpu().numpy()):
-      true_correct[y.cpu().numpy()[j]]+=1
-      if i==0:
-        count0+=correct[j]
-        total0+=1
-      elif i==1:
-        count1+=correct[j]
-        total1+=1
-      elif i==2:
-        count2+=correct[j]
-      else:
-        total2+=1
-    metric=torch.FloatTensor([count0/true_correct[0],count1/true_correct[1],count2/true_correct[2],f1_score(y.cpu().numpy(),predictions.cpu().numpy(),average='macro')])
-    return correct.sum() / torch.FloatTensor([y.shape[0]]),metric,confusion_matrix(y.cpu().numpy(),max_preds.cpu().numpy())
+    true_correct = [0, 0, 0]
+
+    for j, i in enumerate(y.cpu().numpy()):
+        true_correct[y.cpu().numpy()[j]] += 1
+        if i == 0:
+            count0 += correct[j]
+            total0 += 1
+        elif i == 1:
+            count1 += correct[j]
+            total1 += 1
+        elif i == 2:
+            count2 += correct[j]
+        else:
+            total2 += 1
+
+    f1 = f1_score(y.detach().cpu().numpy(), predictions.detach().cpu().numpy(), average='macro')
+    metric = torch.FloatTensor([count0 / true_correct[0], count1 / true_correct[1], count2 / true_correct[2], f1])
+
+    return correct.sum() / torch.FloatTensor([y.shape[0]]), metric, confusion_matrix(y.detach().cpu().numpy(), max_preds.detach().cpu().numpy())
+
 
 
 
@@ -220,33 +238,41 @@ def train(model, iterator, optimizer, criterion, i):
         
     return epoch_loss / len(iterator), epoch_acc / len(iterator)
 
+import torch
 
 def evaluate(model, iterator, criterion, i):
-    
     epoch_loss = 0
     epoch_acc = 0
-    epoch_all_acc = torch.FloatTensor([0,0,0,0])
-    confusion_mat = torch.zeros((3,3))
-    confusion_mat_temp = torch.zeros((3,3))
+    epoch_all_acc = torch.FloatTensor([0, 0, 0, 0])
+    confusion_mat = torch.zeros((3, 3))
 
     model.eval()
-    
+
     with torch.no_grad():
-    
         for batch in iterator:
             if (i == 0):
-              predictions = model(batch.text).squeeze(1)
+                predictions = model(batch.text).squeeze(1)
             else:
-              predictions = model(batch.text,batch_size=len(batch)).squeeze(1)
-            
+                predictions = model(batch.text, batch_size=len(batch)).squeeze(1)
+
             loss = criterion(predictions, batch.label)
-            
-            acc,all_acc,confusion_mat_temp = categorical_accuracy(predictions, batch.label)
+
+            acc, all_acc, confusion_mat_temp = categorical_accuracy(predictions, batch.label)
             epoch_loss += loss.item()
             epoch_acc += acc.item()
-            epoch_all_acc += all_acc
-            confusion_mat+=confusion_mat_temp
-    return epoch_loss / len(iterator), epoch_acc / len(iterator),epoch_all_acc/len(iterator),confusion_mat
+
+            # Update confusion_mat_temp shape to (2, 2)
+            confusion_mat_temp_resized = torch.zeros((2, 2))
+            confusion_mat_temp_resized[:2, :2] = torch.FloatTensor(confusion_mat_temp[:2, :2])
+
+            confusion_mat[:2, :2] += confusion_mat_temp_resized
+
+    return (
+        epoch_loss / len(iterator),
+        epoch_acc / len(iterator),
+        epoch_all_acc / len(iterator),
+        confusion_mat,
+    )
 
 
 import time
@@ -258,7 +284,7 @@ def epoch_time(start_time, end_time):
     return elapsed_mins, elapsed_secs
 
 
-N_EPOCHS = 40
+N_EPOCHS = 10
 
 best_f1 = [-1, -1]
 for epoch in range(N_EPOCHS):
